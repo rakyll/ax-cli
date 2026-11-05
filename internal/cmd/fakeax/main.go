@@ -1,7 +1,7 @@
 // Command fakeax serves an in-memory AX control plane with sample resources,
 // for trying ax-cli without a cluster:
 //
-//	go run ./cmd/fakeax &
+//	go run ./internal/cmd/fakeax &
 //	AX_SERVER=http://127.0.0.1:8080 go run .
 package main
 

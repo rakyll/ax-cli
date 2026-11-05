@@ -113,10 +113,10 @@ given, in which case changes are made without asking.
 
 ## Trying it without a cluster
 
-`cmd/fakeax` is an in-memory AX control plane with sample resources:
+`internal/cmd/fakeax` is an in-memory AX control plane with sample resources:
 
 ```sh
-go run ./cmd/fakeax &                       # serves on 127.0.0.1:8080
+go run ./internal/cmd/fakeax &              # serves on 127.0.0.1:8080
 AX_SERVER=http://127.0.0.1:8080 go run .
 ```
 
@@ -130,4 +130,4 @@ AX_SERVER=http://127.0.0.1:8080 go run .
 | `internal/ax` | AX client: server resolution, CRUD, apply, describe, tables, `ax ssh` |
 | `internal/agent` | The Claude tool loop, tool definitions, system prompt |
 | `internal/tui` | The Bubbletea terminal |
-| `internal/fakeax`, `cmd/fakeax` | In-memory AX server for tests and demos |
+| `internal/fakeax`, `internal/cmd/fakeax` | In-memory AX server for tests and demos |
