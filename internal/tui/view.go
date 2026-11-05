@@ -224,7 +224,7 @@ func (m *model) permissionView(w int) string {
 	options := []string{
 		"Yes",
 		fmt.Sprintf("Yes, and don't ask again for %s this session", label),
-		"No, and tell Claude what to do differently (esc)",
+		"No, and tell " + m.agent.Provider() + " what to do differently (esc)",
 	}
 	for i, o := range options {
 		line := fmt.Sprintf("  %d. %s", i+1, o)

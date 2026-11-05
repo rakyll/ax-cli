@@ -1,4 +1,4 @@
-// Command ax-cli is an interactive terminal for AX: ask Claude to operate your
+// Command ax-cli is an interactive terminal for AX: ask Claude or Gemini to operate your
 // tasks, workspaces, and models in plain English, or drive them directly with
 // slash commands.
 package main
@@ -16,6 +16,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/vertex"
 	"github.com/charmbracelet/lipgloss"
 	"golang.org/x/term"
+	"google.golang.org/genai"
 
 	"github.com/google/ax-cli/internal/agent"
 	"github.com/google/ax-cli/internal/ax"
@@ -33,16 +34,18 @@ Flags:
   -n, --namespace NS    namespace of the AX control plane (default "ax-system")
       --context NAME    kubeconfig context
       --server URL      AX server URL (default: $AX_SERVER, else a tunnel)
-      --model ID        Claude model (default: $AX_CLI_MODEL, $ANTHROPIC_MODEL,
-                        $ANTHROPIC_DEFAULT_OPUS_MODEL, else ` + agent.DefaultModel + `)
+      --model ID        Claude or Gemini model (default: $AX_CLI_MODEL,
+                        $ANTHROPIC_MODEL, $ANTHROPIC_DEFAULT_OPUS_MODEL, else
+                        ` + agent.DefaultModel + `, or ` + agent.DefaultGeminiModel + ` with only Gemini set up)
       --ax-binary PATH  ax CLI used for tunnels and ssh (default "ax")
-      --ax-repo DIR     AX checkout whose docs Claude reads (default ~/ax)
+      --ax-repo DIR     AX checkout whose docs the model reads (default ~/ax)
   -p, --print PROMPT    answer one prompt non-interactively and exit
-      --allow-changes   with -p, let Claude change resources without asking
+      --allow-changes   with -p, let the model change resources without asking
 
 Claude is reached with $ANTHROPIC_API_KEY, or through Vertex AI when
 $CLAUDE_CODE_USE_VERTEX is set (with $ANTHROPIC_VERTEX_PROJECT_ID and
-$CLOUD_ML_REGION).
+$CLOUD_ML_REGION). Gemini models (gemini-*) use the Gemini API with
+$GEMINI_API_KEY or $GOOGLE_API_KEY.
 `
 
 func main() {
@@ -71,7 +74,7 @@ func run() error {
 	}
 	fs.StringVar(&kubeContext, "context", "", "")
 	fs.StringVar(&server, "server", "", "")
-	fs.StringVar(&model, "model", defaultModel(), "")
+	fs.StringVar(&model, "model", "", "")
 	fs.StringVar(&axBinary, "ax-binary", envOr("AX_BINARY", "ax"), "")
 	fs.StringVar(&axRepo, "ax-repo", os.Getenv("AX_REPO"), "")
 	fs.BoolVar(&allowChanges, "allow-changes", false, "")
@@ -102,14 +105,22 @@ func run() error {
 	}
 	defer client.Close()
 
-	// Not ctx: the client outlives the signal handler, which stops once the
+	// Not ctx: the clients outlive the signal handler, which stops once the
 	// terminal takes over Ctrl+C, and Vertex auth refreshes tokens with it.
-	claude, fallbacks, err := newClaude(context.Background())
+	claude, fallbacks, claudeErr := newClaude(context.Background())
+	gemini, err := newGemini(context.Background())
 	if err != nil {
 		return err
 	}
+	if claude == nil && gemini == nil {
+		return fmt.Errorf("no model provider: %v; or set GEMINI_API_KEY to use Gemini", claudeErr)
+	}
+	if model == "" {
+		model = defaultModel(claude != nil)
+	}
 	a := agent.New(agent.Config{
-		Client:          claude,
+		Claude:          claude,
+		Gemini:          gemini,
 		Model:           model,
 		AX:              client,
 		Atespace:        atespace,
@@ -117,6 +128,9 @@ func run() error {
 		ServerFallbacks: fallbacks,
 		ReadOnly:        !interactive && !allowChanges,
 	})
+	if err := a.Check(); err != nil {
+		return err
+	}
 
 	if !interactive {
 		return printMode(ctx, a, prompt, os.Stdout)
@@ -129,25 +143,40 @@ func run() error {
 	return tui.Run(opts)
 }
 
-// newClaude returns a Claude client and whether server-side fallbacks are
-// available, which they are only on the Claude API.
-func newClaude(ctx context.Context) (anthropic.Client, bool, error) {
+// newClaude returns a Claude client, or nil and the reason when Claude is not
+// configured, and whether server-side fallbacks are available, which they are
+// only on the Claude API.
+func newClaude(ctx context.Context) (*anthropic.Client, bool, error) {
 	if truthy(os.Getenv("CLAUDE_CODE_USE_VERTEX")) {
 		project := os.Getenv("ANTHROPIC_VERTEX_PROJECT_ID")
 		if project == "" {
-			return anthropic.Client{}, false, fmt.Errorf("CLAUDE_CODE_USE_VERTEX is set but ANTHROPIC_VERTEX_PROJECT_ID is not")
+			return nil, false, fmt.Errorf("CLAUDE_CODE_USE_VERTEX is set but ANTHROPIC_VERTEX_PROJECT_ID is not")
 		}
 		region := envOr("CLOUD_ML_REGION", "global")
-		return anthropic.NewClient(vertex.WithGoogleAuth(ctx, region, project)), false, nil
+		c := anthropic.NewClient(vertex.WithGoogleAuth(ctx, region, project))
+		return &c, false, nil
 	}
 	if os.Getenv("ANTHROPIC_API_KEY") == "" && os.Getenv("ANTHROPIC_AUTH_TOKEN") == "" {
-		return anthropic.Client{}, false, fmt.Errorf("set ANTHROPIC_API_KEY, or CLAUDE_CODE_USE_VERTEX=1 with ANTHROPIC_VERTEX_PROJECT_ID to use Vertex AI")
+		return nil, false, fmt.Errorf("set ANTHROPIC_API_KEY, or CLAUDE_CODE_USE_VERTEX=1 with ANTHROPIC_VERTEX_PROJECT_ID to use Vertex AI")
 	}
-	return anthropic.NewClient(), true, nil
+	c := anthropic.NewClient()
+	return &c, true, nil
+}
+
+// newGemini returns a Gemini API client, or nil when no API key is set.
+func newGemini(ctx context.Context) (*genai.Client, error) {
+	key := os.Getenv("GEMINI_API_KEY")
+	if key == "" {
+		key = os.Getenv("GOOGLE_API_KEY")
+	}
+	if key == "" {
+		return nil, nil
+	}
+	return genai.NewClient(ctx, &genai.ClientConfig{APIKey: key, Backend: genai.BackendGeminiAPI})
 }
 
 // printMode answers one prompt, streaming the reply to w. Tool activity goes
-// to stderr so stdout holds only Claude's answer.
+// to stderr so stdout holds only the model's answer.
 func printMode(ctx context.Context, a *agent.Agent, prompt string, w io.Writer) error {
 	events := make(chan agent.Event, 64)
 	go a.Run(ctx, prompt, events)
@@ -180,10 +209,17 @@ func printMode(ctx context.Context, a *agent.Agent, prompt string, w io.Writer) 
 	return nil
 }
 
-// defaultModel honors ax-cli's own variable first, then the ones Claude Code
-// reads, so a Vertex project pinned to particular model versions just works.
-func defaultModel() string {
-	for _, k := range []string{"AX_CLI_MODEL", "ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL"} {
+// defaultModel honors ax-cli's own variable first, then, when Claude is set
+// up, the ones Claude Code reads, so a Vertex project pinned to particular
+// model versions just works.
+func defaultModel(haveClaude bool) string {
+	if v := os.Getenv("AX_CLI_MODEL"); v != "" {
+		return v
+	}
+	if !haveClaude {
+		return agent.DefaultGeminiModel
+	}
+	for _, k := range []string{"ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL"} {
 		if v := os.Getenv(k); v != "" {
 			return v
 		}

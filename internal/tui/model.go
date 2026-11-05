@@ -74,13 +74,23 @@ type model struct {
 	flash               string
 	quitting            bool
 
-	// out collects lines to print above the live area at the end of Update.
-	out []string
+	// out collects blocks to print above the live area at the end of Update.
+	// Blocks render lazily at the current width, and every block printed so
+	// far stays in transcript so a resize can redraw the session.
+	out        []block
+	transcript []block
+	banner     string
+	resizes    int
 }
+
+// block renders one piece of printed output at the model's current width.
+type block func() string
 
 type (
 	agentEventMsg struct{ ev agent.Event }
 	clearFlashMsg struct{}
+	// reflowMsg redraws the session once the window stops resizing.
+	reflowMsg struct{ resizes int }
 )
 
 // Run starts the interactive terminal and blocks until the user exits.
@@ -114,16 +124,17 @@ func newModel(opts Options) *model {
 	sp.Style = accentS
 
 	return &model{
-		agent: opts.Agent,
-		ax:    opts.AX,
-		dark:  opts.Dark,
-		cmds:  commands(),
-		ta:    ta,
-		spin:  sp,
-		hist:  loadHistory(historyPath()),
-		names: map[string][]string{},
-		width: 80,
-		md:    newMarkdown(80, opts.Dark),
+		agent:  opts.Agent,
+		ax:     opts.AX,
+		dark:   opts.Dark,
+		cmds:   commands(),
+		ta:     ta,
+		spin:   sp,
+		hist:   loadHistory(historyPath()),
+		names:  map[string][]string{},
+		width:  80,
+		md:     newMarkdown(80, opts.Dark),
+		banner: Banner(opts),
 	}
 }
 
@@ -136,21 +147,54 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	if len(m.out) == 0 {
 		return m, cmd
 	}
-	// Print before anything else runs so output keeps its order. The
-	// renderer counts lines by newline, so nothing may soft-wrap.
-	p := tea.Println(ansi.Wrap(strings.Join(m.out, "\n"), max(m.width-1, 20), ""))
+	// Print before anything else runs so output keeps its order.
+	p := tea.Println(m.render(m.out))
+	m.transcript = append(m.transcript, m.out...)
 	m.out = nil
 	return m, tea.Sequence(p, cmd)
+}
+
+// render renders blocks for printing. The renderer counts lines by newline,
+// so nothing may soft-wrap.
+func (m *model) render(blocks []block) string {
+	parts := make([]string, len(blocks))
+	for i, b := range blocks {
+		parts[i] = b()
+	}
+	return ansi.Wrap(strings.Join(parts, "\n"), max(m.width-1, 20), "")
+}
+
+// reflow clears the screen and scrollback and prints the session again at
+// the current width. Without it, the terminal rewraps old output and the
+// renderer loses track of the live area.
+func (m *model) reflow() tea.Cmd {
+	all := append([]block{func() string { return m.banner }}, m.transcript...)
+	return tea.Sequence(tea.ClearScreen, tea.Println(ansi.EraseDisplay(3)+m.render(all)))
 }
 
 func (m *model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
+		first := m.resizes == 0
+		if msg.Width == m.width && !first {
+			return nil
+		}
+		m.resizes++
 		m.width = msg.Width
 		m.ta.SetWidth(max(msg.Width-4, 10))
 		m.md = newMarkdown(msg.Width, m.dark)
 		m.resizeInput()
-		return nil
+		if first {
+			return nil
+		}
+		n := m.resizes
+		return tea.Tick(150*time.Millisecond, func(time.Time) tea.Msg { return reflowMsg{n} })
+
+	case reflowMsg:
+		if msg.resizes != m.resizes {
+			return nil // still resizing
+		}
+		return m.reflow()
 
 	case tea.KeyMsg:
 		return m.key(msg)
@@ -173,6 +217,8 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 			m.result(dimS.Render("Interrupted"))
 		case msg.err != nil:
 			m.result(errS.Render(ax.ErrorMessage(msg.err)))
+		case msg.md != "":
+			m.emit(func() string { return gutter(dimS.Render("  ⎿  "), renderMarkdown(m.md, msg.md)) })
 		case msg.out != "":
 			m.result(msg.out)
 		}
@@ -457,14 +503,17 @@ func (m *model) event(ev agent.Event) tea.Cmd {
 		m.flushText()
 		m.tools = nil
 		m.perm = nil
-		m.tokensIn += int(ev.InputTokens + ev.CacheReadTokens)
+		m.tokensIn += int(ev.InputTokens)
 		m.tokensOut += int(ev.OutputTokens)
 		switch {
 		case ev.Interrupted:
-			m.result(dimS.Render("Interrupted · What should Claude do instead?"))
+			m.result(dimS.Render("Interrupted · What should " + m.agent.Provider() + " do instead?"))
 		case ev.Err != nil:
-			wrapped := lipgloss.NewStyle().Width(max(m.width-4, 20)).Render(ev.Err.Error())
-			m.print(gutter(errS.Render("⏺ "), errS.Render(wrapped)))
+			msg := ev.Err.Error()
+			m.emit(func() string {
+				wrapped := lipgloss.NewStyle().Width(max(m.width-4, 20)).Render(msg)
+				return "\n" + gutter(errS.Render("⏺ "), errS.Render(wrapped))
+			})
 		}
 		m.stopBusy()
 		return tea.Batch(m.refreshNames(), m.dequeue())
@@ -478,8 +527,13 @@ func (m *model) flushThinking() {
 	if t == "" {
 		return
 	}
-	wrapped := lipgloss.NewStyle().Width(max(m.width-4, 20)).Render(t)
-	m.print(gutter(dimS.Render("✻ "), thinkS.Render(wrapped)))
+	// Gemini titles its thought summaries in bold; thinking is not rendered
+	// as markdown, so drop the markers.
+	t = strings.ReplaceAll(t, "**", "")
+	m.emit(func() string {
+		wrapped := lipgloss.NewStyle().Width(max(m.width-4, 20)).Render(t)
+		return "\n" + gutter(dimS.Render("✻ "), thinkS.Render(wrapped))
+	})
 }
 
 func (m *model) flushText() {
@@ -491,13 +545,12 @@ func (m *model) flushText() {
 }
 
 func (m *model) printText(md string) {
-	r := renderMarkdown(m.md, md)
-	if m.textStarted {
-		m.out = append(m.out, "", gutter("  ", r))
-		return
+	mark := "  "
+	if !m.textStarted {
+		mark = "⏺ "
 	}
 	m.textStarted = true
-	m.print(gutter("⏺ ", r))
+	m.emit(func() string { return "\n" + gutter(mark, renderMarkdown(m.md, md)) })
 }
 
 // toolLabels are the display names of the agent's tools.
@@ -555,7 +608,8 @@ func (m *model) printTool(start agent.ToolStart, done agent.ToolDone) {
 			out += "\n" + dimS.Render(fmt.Sprintf("… +%d lines", more))
 		}
 	}
-	m.print(gutter(mark, toolHeader(start)) + "\n" + gutter(dimS.Render("  ⎿  "), m.wrap(out, 5)))
+	header := gutter(mark, toolHeader(start))
+	m.emit(func() string { return "\n" + header + "\n" + gutter(dimS.Render("  ⎿  "), m.wrap(out, 5)) })
 }
 
 // colorPhases colors known phase words in a task table.
@@ -566,14 +620,19 @@ func colorPhases(s string) string {
 	return s
 }
 
-// print queues a block for the scrollback, separated by a blank line.
+// emit queues a block for the scrollback.
+func (m *model) emit(b block) {
+	m.out = append(m.out, b)
+}
+
+// print queues width-independent output, separated by a blank line.
 func (m *model) print(s string) {
-	m.out = append(m.out, "", s)
+	m.emit(func() string { return "\n" + s })
 }
 
 // result prints a command result under the line that ran it.
 func (m *model) result(s string) {
-	m.out = append(m.out, gutter(dimS.Render("  ⎿  "), m.wrap(s, 5)))
+	m.emit(func() string { return gutter(dimS.Render("  ⎿  "), m.wrap(s, 5)) })
 }
 
 // wrap wraps s to fit beside a gutter of the given width.

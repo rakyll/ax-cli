@@ -1,25 +1,26 @@
-// Package agent runs the conversational loop: it streams Claude's replies,
-// executes AX tools on its behalf, and asks the user before anything that
-// changes the cluster.
+// Package agent runs the conversational loop: it streams the model's replies
+// (Claude or Gemini), executes AX tools on its behalf, and asks the user before
+// anything that changes the cluster.
 package agent
 
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/packages/param"
-	"github.com/anthropics/anthropic-sdk-go/shared/constant"
+	"google.golang.org/genai"
 
 	"github.com/google/ax-cli/internal/ax"
 )
 
-// DefaultModel is the Claude model used unless --model says otherwise.
+// DefaultModel is the model used unless --model says otherwise.
 const DefaultModel = "claude-opus-5"
+
+// DefaultGeminiModel is the default when only Gemini is configured.
+const DefaultGeminiModel = "gemini-3.1-pro-preview"
 
 // Decision is the user's answer to a permission request.
 type Decision int
@@ -36,11 +37,11 @@ const (
 type (
 	// TextDelta is a chunk of streamed assistant text.
 	TextDelta struct{ Text string }
-	// ThinkingDelta is a chunk of Claude's summarized reasoning.
+	// ThinkingDelta is a chunk of the model's summarized reasoning.
 	ThinkingDelta struct{ Text string }
 	// BlockDone marks the end of a streamed text or thinking block.
 	BlockDone struct{}
-	// ToolStart is sent when Claude calls a tool, before it runs.
+	// ToolStart is sent when the model calls a tool, before it runs.
 	ToolStart struct {
 		ID, Name, Summary string
 	}
@@ -67,7 +68,10 @@ type (
 
 // Config configures an Agent.
 type Config struct {
-	Client   anthropic.Client
+	// Claude and Gemini are the API clients; either may be nil when its
+	// provider is not configured.
+	Claude   *anthropic.Client
+	Gemini   *genai.Client
 	Model    string
 	AX       *ax.Client
 	Atespace string
@@ -86,7 +90,7 @@ type Agent struct {
 	tools []*tool
 
 	mu          sync.Mutex
-	messages    []anthropic.BetaMessageParam
+	conv        conversation
 	atespace    string
 	notes       []string
 	alwaysAllow map[string]bool
@@ -97,21 +101,70 @@ func New(cfg Config) *Agent {
 	if cfg.Model == "" {
 		cfg.Model = DefaultModel
 	}
-	return &Agent{cfg: cfg, tools: axTools(), atespace: cfg.Atespace, alwaysAllow: map[string]bool{}}
+	a := &Agent{cfg: cfg, tools: axTools(), atespace: cfg.Atespace, alwaysAllow: map[string]bool{}}
+	a.conv = a.newConversation(cfg.Model)
+	return a
 }
 
-// Model returns the Claude model in use.
+// Provider names the API serving model: "Gemini" for gemini-* models, else
+// "Claude".
+func Provider(model string) string {
+	if strings.HasPrefix(model, "gemini") || strings.HasPrefix(model, "models/gemini") {
+		return "Gemini"
+	}
+	return "Claude"
+}
+
+// Model returns the model in use.
 func (a *Agent) Model() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.cfg.Model
 }
 
-// SetModel switches the Claude model for subsequent turns.
-func (a *Agent) SetModel(model string) {
+// Provider returns the name of the API serving the current model.
+func (a *Agent) Provider() string { return Provider(a.Model()) }
+
+// SetModel switches the model for subsequent turns. Histories do not carry
+// across providers, so switching between Claude and Gemini starts a new
+// conversation; restarted reports whether it did.
+func (a *Agent) SetModel(model string) (restarted bool, err error) {
+	if err := a.check(model); err != nil {
+		return false, err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if Provider(model) != Provider(a.cfg.Model) {
+		restarted = !a.conv.empty()
+		a.conv = a.newConversation(model)
+		a.notes = nil
+	}
 	a.cfg.Model = model
+	return restarted, nil
+}
+
+// Check reports whether the provider for the current model is configured.
+func (a *Agent) Check() error { return a.check(a.Model()) }
+
+func (a *Agent) check(model string) error {
+	switch Provider(model) {
+	case "Gemini":
+		if a.cfg.Gemini == nil {
+			return fmt.Errorf("%s needs the Gemini API: set GEMINI_API_KEY", model)
+		}
+	default:
+		if a.cfg.Claude == nil {
+			return fmt.Errorf("%s needs Claude: set ANTHROPIC_API_KEY, or CLAUDE_CODE_USE_VERTEX=1 with ANTHROPIC_VERTEX_PROJECT_ID", model)
+		}
+	}
+	return nil
+}
+
+func (a *Agent) newConversation(model string) conversation {
+	if Provider(model) == "Gemini" {
+		return &geminiConv{client: a.cfg.Gemini}
+	}
+	return &claudeConv{client: a.cfg.Claude, fallbacks: a.cfg.ServerFallbacks}
 }
 
 // Atespace returns the atespace tools default to.
@@ -121,7 +174,7 @@ func (a *Agent) Atespace() string {
 	return a.atespace
 }
 
-// SetAtespace changes the default atespace and tells Claude on the next turn.
+// SetAtespace changes the default atespace and tells the model on the next turn.
 func (a *Agent) SetAtespace(atespace string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -132,7 +185,7 @@ func (a *Agent) SetAtespace(atespace string) {
 	a.notes = append(a.notes, fmt.Sprintf("The user switched the session atespace to %q. Tools now default to it.", atespace))
 }
 
-// Note queues context for Claude that is sent with the next user message, for
+// Note queues context for the model that is sent with the next user message, for
 // example the output of a slash command the user ran.
 func (a *Agent) Note(text string) {
 	a.mu.Lock()
@@ -144,16 +197,62 @@ func (a *Agent) Note(text string) {
 func (a *Agent) Reset() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.messages = nil
+	a.conv = a.newConversation(a.cfg.Model)
 	a.notes = nil
 	a.alwaysAllow = map[string]bool{}
 }
 
-// Run sends prompt and drives the tool loop until Claude finishes, sending
+// conversation is one provider's message history and the way to extend it.
+// Implementations guard their own history; step is never called concurrently.
+type conversation interface {
+	empty() bool
+	// addUser appends user text, joining a trailing user turn if there is
+	// one (after an interrupted tool round the history ends with results).
+	addUser(text string)
+	// step streams one model response, forwarding deltas to events, and on
+	// success appends it to the history.
+	step(ctx context.Context, req request, events chan<- Event) (stepResult, error)
+	// addResults appends the results of the calls from the last step.
+	addResults(results []toolResult)
+	// rollback drops a trailing user prompt that never got a reply. Trailing
+	// tool results are kept: they must stay paired with their calls.
+	rollback()
+}
+
+type request struct {
+	model, system string
+	tools         []*tool
+}
+
+type stepResult struct {
+	calls []toolCall
+	// again asks for another step with no new input, as when the server
+	// paused a long turn.
+	again bool
+	// stop ends the turn with an error, such as a refusal.
+	stop                       error
+	inTokens, outTokens, cache int64
+}
+
+type toolCall struct {
+	ID, Name string
+	Input    json.RawMessage
+}
+
+type toolResult struct {
+	call    toolCall
+	output  string
+	isError bool
+}
+
+// Run sends prompt and drives the tool loop until the model finishes, sending
 // events as it goes. It always finishes by sending a TurnDone.
 func (a *Agent) Run(ctx context.Context, prompt string, events chan<- Event) {
 	done := TurnDone{}
 	defer func() { events <- done }()
+	if done.Err = a.Check(); done.Err != nil {
+		return
+	}
 
 	a.mu.Lock()
 	text := prompt
@@ -161,63 +260,42 @@ func (a *Agent) Run(ctx context.Context, prompt string, events chan<- Event) {
 		text = "<session-notes>\n" + strings.Join(a.notes, "\n") + "\n</session-notes>\n\n" + prompt
 		a.notes = nil
 	}
-	// After an interrupted tool round the history ends with tool results; the
-	// new prompt joins that user turn rather than starting a second one.
-	if n := len(a.messages); n > 0 && a.messages[n-1].Role == anthropic.BetaMessageParamRoleUser {
-		a.messages[n-1].Content = append(a.messages[n-1].Content, anthropic.NewBetaTextBlock(text))
-	} else {
-		a.messages = append(a.messages, anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(text)))
-	}
+	conv := a.conv
+	req := request{model: a.cfg.Model, system: systemPrompt(a.cfg), tools: a.tools}
 	a.mu.Unlock()
+	conv.addUser(text)
 
 	for {
-		msg, err := a.stream(ctx, events)
-		if msg != nil {
-			done.InputTokens += msg.Usage.InputTokens + msg.Usage.CacheReadInputTokens + msg.Usage.CacheCreationInputTokens
-			done.OutputTokens += msg.Usage.OutputTokens
-			done.CacheReadTokens += msg.Usage.CacheReadInputTokens
-		}
+		res, err := conv.step(ctx, req, events)
+		done.InputTokens += res.inTokens
+		done.OutputTokens += res.outTokens
+		done.CacheReadTokens += res.cache
 		if err != nil {
 			if ctx.Err() != nil {
-				// Keep the prompt so Claude knows what it was doing; the
-				// next prompt joins this user turn.
+				// Keep the prompt so the model knows what it was doing;
+				// the next prompt joins this user turn.
 				done.Interrupted = true
 				a.Note("The user interrupted your previous response before it finished.")
 			} else {
-				a.rollbackDanglingUser()
+				conv.rollback()
 				done.Err = err
 			}
 			return
 		}
-
-		a.mu.Lock()
-		a.messages = append(a.messages, msg.ToParam())
-		a.mu.Unlock()
-
-		switch msg.StopReason {
-		case anthropic.BetaStopReasonToolUse:
-			results := a.runTools(ctx, msg, events)
-			a.mu.Lock()
-			a.messages = append(a.messages, anthropic.NewBetaUserMessage(results...))
-			a.mu.Unlock()
+		if res.stop != nil {
+			done.Err = res.stop
+			return
+		}
+		if len(res.calls) > 0 {
+			conv.addResults(a.runTools(ctx, res.calls, events))
 			if ctx.Err() != nil {
 				done.Interrupted = true
 				a.Note("The user interrupted you after the tool calls above.")
 				return
 			}
-		case anthropic.BetaStopReasonPauseTurn:
-			// The server paused a long turn; sending the history back resumes it.
-		case anthropic.BetaStopReasonRefusal:
-			reason := "Claude declined to continue this request"
-			if msg.StopDetails.Explanation != "" {
-				reason += ": " + msg.StopDetails.Explanation
-			}
-			done.Err = errors.New(reason)
-			return
-		case anthropic.BetaStopReasonMaxTokens:
-			done.Err = errors.New("the response hit the output token limit; ask Claude to continue")
-			return
-		default:
+			continue
+		}
+		if !res.again {
 			return
 		}
 	}
@@ -226,102 +304,19 @@ func (a *Agent) Run(ctx context.Context, prompt string, events chan<- Event) {
 // Event is any of the event types above.
 type Event any
 
-// stream makes one streaming request and forwards deltas to the UI.
-func (a *Agent) stream(ctx context.Context, events chan<- Event) (*anthropic.BetaMessage, error) {
-	a.mu.Lock()
-	params := anthropic.BetaMessageNewParams{
-		Model:     a.cfg.Model,
-		MaxTokens: 64000,
-		System: []anthropic.BetaTextBlockParam{{
-			Text:         systemPrompt(a.cfg),
-			CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
-		}},
-		Messages: append([]anthropic.BetaMessageParam(nil), a.messages...),
-		Tools:    toolParams(a.tools),
-		Thinking: anthropic.BetaThinkingConfigParamUnion{
-			OfAdaptive: &anthropic.BetaThinkingConfigAdaptiveParam{Display: anthropic.BetaThinkingConfigAdaptiveDisplaySummarized},
-		},
-		// Caches the conversation so far, so each tool round trip only pays for
-		// what is new.
-		CacheControl: anthropic.NewBetaCacheControlEphemeralParam(),
-	}
-	if a.cfg.ServerFallbacks {
-		params.Betas = []anthropic.AnthropicBeta{anthropic.AnthropicBetaServerSideFallback2026_07_01}
-		params.Fallbacks = anthropic.BetaFallbacksParamUnion{OfDefault: constant.ValueOf[constant.Default]()}
-	}
-	a.mu.Unlock()
-
-	s := a.cfg.Client.Beta.Messages.NewStreaming(ctx, params)
-	defer s.Close()
-	msg := anthropic.BetaMessage{}
-	inBlock := false
-	for s.Next() {
-		ev := s.Current()
-		if err := msg.Accumulate(ev); err != nil {
-			return nil, err
-		}
-		switch e := ev.AsAny().(type) {
-		case anthropic.BetaRawContentBlockDeltaEvent:
-			switch d := e.Delta.AsAny().(type) {
-			case anthropic.BetaTextDelta:
-				inBlock = true
-				events <- TextDelta{Text: d.Text}
-			case anthropic.BetaThinkingDelta:
-				inBlock = true
-				events <- ThinkingDelta{Text: d.Thinking}
-			}
-		case anthropic.BetaRawContentBlockStopEvent:
-			if inBlock {
-				events <- BlockDone{}
-				inBlock = false
-			}
-		}
-	}
-	if err := s.Err(); err != nil {
-		if inBlock {
-			events <- BlockDone{}
-		}
-		return &msg, err
-	}
-	return &msg, nil
-}
-
-// rollbackDanglingUser drops a trailing user prompt that never got a reply.
-// Trailing tool results are kept: they must stay paired with the tool calls
-// before them, and the next prompt is appended to that turn.
-func (a *Agent) rollbackDanglingUser() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	n := len(a.messages)
-	if n == 0 || a.messages[n-1].Role != anthropic.BetaMessageParamRoleUser {
-		return
-	}
-	for _, b := range a.messages[n-1].Content {
-		if b.OfToolResult != nil {
-			return
-		}
-	}
-	a.messages = a.messages[:n-1]
-}
-
-// runTools executes every tool call in msg, in order, and returns one
-// tool_result per call. Calls left after a cancellation are answered with an
-// error so the history stays valid.
-func (a *Agent) runTools(ctx context.Context, msg *anthropic.BetaMessage, events chan<- Event) []anthropic.BetaContentBlockParamUnion {
-	var results []anthropic.BetaContentBlockParamUnion
-	for _, block := range msg.Content {
-		use, ok := block.AsAny().(anthropic.BetaToolUseBlock)
-		if !ok {
-			continue
-		}
-		out, isErr := a.runTool(ctx, use, events)
-		events <- ToolDone{ID: use.ID, Name: use.Name, Output: out, IsError: isErr}
-		results = append(results, anthropic.NewBetaToolResultBlock(use.ID, out, isErr))
+// runTools executes calls in order and returns one result per call. Calls left
+// after a cancellation are answered with an error so the history stays valid.
+func (a *Agent) runTools(ctx context.Context, calls []toolCall, events chan<- Event) []toolResult {
+	var results []toolResult
+	for _, c := range calls {
+		out, isErr := a.runTool(ctx, c, events)
+		events <- ToolDone{ID: c.ID, Name: c.Name, Output: out, IsError: isErr}
+		results = append(results, toolResult{call: c, output: out, isError: isErr})
 	}
 	return results
 }
 
-func (a *Agent) runTool(ctx context.Context, use anthropic.BetaToolUseBlock, events chan<- Event) (string, bool) {
+func (a *Agent) runTool(ctx context.Context, use toolCall, events chan<- Event) (string, bool) {
 	if ctx.Err() != nil {
 		events <- ToolStart{ID: use.ID, Name: use.Name}
 		return "Interrupted by the user before this tool ran.", true
@@ -331,11 +326,7 @@ func (a *Agent) runTool(ctx context.Context, use anthropic.BetaToolUseBlock, eve
 		events <- ToolStart{ID: use.ID, Name: use.Name}
 		return fmt.Sprintf("unknown tool %q", use.Name), true
 	}
-	raw, ok := use.Input.(json.RawMessage)
-	if !ok {
-		raw, _ = json.Marshal(use.Input)
-	}
-	in, err := parseInput(raw, t.required)
+	in, err := parseInput(use.Input, t.required)
 	if err != nil {
 		events <- ToolStart{ID: use.ID, Name: use.Name}
 		return fmt.Sprintf("invalid input: %v. Fix the arguments and call the tool again.", err), true
@@ -444,19 +435,6 @@ func parseInput(raw json.RawMessage, required []string) (input, error) {
 		}
 	}
 	return in, nil
-}
-
-func toolParams(tools []*tool) []anthropic.BetaToolUnionParam {
-	out := make([]anthropic.BetaToolUnionParam, 0, len(tools))
-	for _, t := range tools {
-		out = append(out, anthropic.BetaToolUnionParam{OfTool: &anthropic.BetaToolParam{
-			Name:                t.name,
-			Description:         param.NewOpt(t.description),
-			InputSchema:         anthropic.BetaToolInputSchemaParam{Properties: t.properties, Required: t.required},
-			EagerInputStreaming: param.NewOpt(true),
-		}})
-	}
-	return out
 }
 
 func findTool(tools []*tool, name string) *tool {

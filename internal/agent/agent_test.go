@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"google.golang.org/genai"
 
 	"github.com/google/ax-cli/internal/ax"
 	"github.com/google/ax-cli/internal/fakeax"
@@ -48,7 +49,7 @@ func runTool(t *testing.T, a *Agent, name string, in map[string]any, decision De
 	}
 	done := make(chan result)
 	go func() {
-		out, isErr := a.runTool(context.Background(), anthropic.BetaToolUseBlock{ID: "t1", Name: name, Input: json.RawMessage(raw)}, events)
+		out, isErr := a.runTool(context.Background(), toolCall{ID: "t1", Name: name, Input: raw}, events)
 		done <- result{out, isErr}
 	}()
 	for {
@@ -136,23 +137,71 @@ func TestParseInput(t *testing.T) {
 }
 
 func TestRollbackDanglingUser(t *testing.T) {
-	a := &Agent{}
-	a.messages = []anthropic.BetaMessageParam{
-		anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock("hi")),
+	c := &claudeConv{}
+	c.addUser("hi")
+	c.rollback()
+	if !c.empty() {
+		t.Errorf("Claude: plain prompt kept after a failed request")
 	}
-	a.rollbackDanglingUser()
-	if len(a.messages) != 0 {
-		t.Errorf("plain prompt kept after a failed request")
-	}
-
-	a.messages = []anthropic.BetaMessageParam{
+	c.messages = []anthropic.BetaMessageParam{
 		anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock("hi")),
 		{Role: anthropic.BetaMessageParamRoleAssistant, Content: []anthropic.BetaContentBlockParamUnion{anthropic.NewBetaToolUseBlock("t1", map[string]any{}, "list_resources")}},
-		anthropic.NewBetaUserMessage(anthropic.NewBetaToolResultBlock("t1", "ok", false)),
 	}
-	a.rollbackDanglingUser()
-	if len(a.messages) != 3 {
-		t.Errorf("tool results dropped; they must stay paired with their calls")
+	c.addResults([]toolResult{{call: toolCall{ID: "t1", Name: "list_resources"}, output: "ok"}})
+	c.rollback()
+	if len(c.messages) != 3 {
+		t.Errorf("Claude: tool results dropped; they must stay paired with their calls")
+	}
+
+	g := &geminiConv{}
+	g.addUser("hi")
+	g.rollback()
+	if !g.empty() {
+		t.Errorf("Gemini: plain prompt kept after a failed request")
+	}
+	g.contents = []*genai.Content{
+		{Role: genai.RoleUser, Parts: []*genai.Part{{Text: "hi"}}},
+		{Role: genai.RoleModel, Parts: []*genai.Part{{FunctionCall: &genai.FunctionCall{Name: "list_resources"}}}},
+	}
+	g.madeUp = map[string]bool{"gemini-call-1": true}
+	g.addResults([]toolResult{{call: toolCall{ID: "gemini-call-1", Name: "list_resources"}, output: "ok"}})
+	g.rollback()
+	if len(g.contents) != 3 {
+		t.Fatalf("Gemini: tool results dropped; they must stay paired with their calls")
+	}
+	// The next prompt joins the results turn, and a made-up ID is not sent.
+	g.addUser("next")
+	last := g.contents[2]
+	if len(g.contents) != 3 || len(last.Parts) != 2 || last.Parts[0].FunctionResponse.ID != "" {
+		t.Errorf("Gemini: results turn = %+v", last.Parts)
+	}
+}
+
+func TestMergeable(t *testing.T) {
+	text := &genai.Part{Text: "a"}
+	if !mergeable(text, &genai.Part{Text: "b"}) {
+		t.Error("text chunks not merged")
+	}
+	if mergeable(text, &genai.Part{Text: "b", Thought: true}) {
+		t.Error("thought merged into text")
+	}
+	if mergeable(&genai.Part{Text: "a", ThoughtSignature: []byte("s")}, &genai.Part{Text: "b"}) {
+		t.Error("merged past a signature")
+	}
+}
+
+func TestProviderSwitch(t *testing.T) {
+	a := New(Config{Model: "claude-opus-5", Claude: &anthropic.Client{}})
+	if _, err := a.SetModel("gemini-3.1-pro-preview"); err == nil {
+		t.Error("switched to Gemini without a Gemini client")
+	}
+	a = New(Config{Model: "claude-opus-5", Claude: &anthropic.Client{}, Gemini: &genai.Client{}})
+	a.conv.addUser("hi")
+	if restarted, err := a.SetModel("claude-sonnet-5"); err != nil || restarted {
+		t.Errorf("same-provider switch = %v, %v", restarted, err)
+	}
+	if restarted, err := a.SetModel("gemini-3.1-pro-preview"); err != nil || !restarted || !a.conv.empty() || a.Provider() != "Gemini" {
+		t.Errorf("cross-provider switch = %v, %v", restarted, err)
 	}
 }
 

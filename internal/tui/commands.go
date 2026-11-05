@@ -16,7 +16,7 @@ import (
 	"github.com/google/ax-cli/internal/ax"
 )
 
-// command is a slash command. Slash commands act directly, without Claude.
+// command is a slash command. Slash commands act directly, without the model.
 type command struct {
 	name    string
 	aliases []string
@@ -31,8 +31,10 @@ type command struct {
 // cmdDoneMsg reports a finished slash or shell command.
 type cmdDoneMsg struct {
 	out string
+	// md is markdown output, rendered on the UI goroutine at the current width.
+	md  string
 	err error
-	// note, when set, tells Claude what the user saw.
+	// note, when set, tells the model what the user saw.
 	note string
 	// refresh reloads resource names for completion.
 	refresh bool
@@ -40,7 +42,10 @@ type cmdDoneMsg struct {
 
 var kinds = []string{"task", "workspace", "model"}
 
-var models = []string{"claude-opus-5", "claude-opus-5-5", "claude-sonnet-5", "claude-fable-5-1", "claude-haiku-4-5"}
+var models = []string{
+	"claude-opus-5", "claude-opus-5-5", "claude-sonnet-5", "claude-fable-5-1", "claude-haiku-4-5",
+	"gemini-3.1-pro-preview", "gemini-pro-latest", "gemini-3.5-flash", "gemini-3-flash-preview",
+}
 
 func commands() []*command {
 	return []*command{
@@ -142,7 +147,7 @@ func commands() []*command {
 		},
 		{name: "ctx", aliases: []string{"context"}, desc: "Show the cluster connection", run: (*model).showContext},
 		{
-			name: "model", args: "[id]", desc: "Show or switch the Claude model",
+			name: "model", args: "[id]", desc: "Show or switch the model (Claude or Gemini)",
 			complete: func(_ *model, i int, _ []string, _ string) []string {
 				if i == 0 {
 					return models
@@ -154,8 +159,17 @@ func commands() []*command {
 					m.say("model: " + m.agent.Model())
 					return nil
 				}
-				m.agent.SetModel(args[0])
-				m.say("Switched to " + boldS.Render(args[0]))
+				restarted, err := m.agent.SetModel(args[0])
+				if err != nil {
+					m.say(errS.Render(err.Error()))
+					return nil
+				}
+				msg := "Switched to " + boldS.Render(args[0])
+				if restarted {
+					m.tokensIn, m.tokensOut = 0, 0
+					msg += dimS.Render(" · new conversation; history does not carry between Claude and Gemini")
+				}
+				m.say(msg)
 				return nil
 			},
 		},
@@ -280,7 +294,7 @@ func (m *model) get(kind, name string) tea.Cmd {
 			return cmdDoneMsg{err: err}
 		}
 		y := ax.YAML(res)
-		return cmdDoneMsg{out: renderMarkdown(m.md, "```yaml\n"+y+"\n```"), note: y}
+		return cmdDoneMsg{md: "```yaml\n" + y + "\n```", note: y}
 	})
 }
 
@@ -390,7 +404,7 @@ func (m *model) shell(line string) tea.Cmd {
 
 func (m *model) help(_ []string) tea.Cmd {
 	var sb strings.Builder
-	sb.WriteString(boldS.Render("Ask in plain English") + " and Claude runs AX operations for you, asking before it changes anything.\n\n")
+	sb.WriteString(boldS.Render("Ask in plain English") + " and the model runs AX operations for you, asking before it changes anything.\n\n")
 	sb.WriteString(boldS.Render("Commands") + "\n")
 	for _, c := range m.cmds {
 		name := "/" + c.name
@@ -405,7 +419,7 @@ func (m *model) help(_ []string) tea.Cmd {
 		{"tab", "Complete commands and resource names"},
 		{"↑ / ↓", "Browse history"},
 		{"\\ + enter, ctrl+j", "Insert a newline"},
-		{"esc", "Interrupt Claude"},
+		{"esc", "Interrupt the model"},
 		{"ctrl+c twice", "Exit"},
 	} {
 		fmt.Fprintf(&sb, "  %s %s\n", accentS.Render(fmt.Sprintf("%-30s", kv[0])), dimS.Render(kv[1]))
