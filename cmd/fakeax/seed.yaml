@@ -1,0 +1,51 @@
+apiVersion: ax.io/v1alpha1
+kind: Workspace
+metadata:
+  name: ax-repo
+spec:
+  git:
+    - name: ax
+      repo: https://github.com/google/ax
+      branch: main
+---
+apiVersion: ax.io/v1alpha1
+kind: Model
+metadata:
+  name: claude
+spec:
+  provider: anthropic
+  model: claude-opus-5
+  secretKey:
+    name: anthropic
+    key: api-key
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: api-refactor
+spec:
+  image: "gcr.io/ax-substrate/ate-images/ax-task-runner@sha256:3a0dea6ad8b55278685db58aca6e37dc4ba04056831d45bef3aaeafdca43cac6"
+  command: ["sleep", "infinity"]
+  workspace:
+    name: ax-repo
+  debug: true
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: flaky-tests
+spec:
+  image: "gcr.io/ax-substrate/ate-images/ax-task-runner@sha256:3a0dea6ad8b55278685db58aca6e37dc4ba04056831d45bef3aaeafdca43cac6"
+  command: ["go", "test", "-count=20", "./..."]
+  workspace:
+    name: ax-repo
+---
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: docs-review
+spec:
+  image: "gcr.io/ax-substrate/ate-images/ax-task-runner@sha256:3a0dea6ad8b55278685db58aca6e37dc4ba04056831d45bef3aaeafdca43cac6"
+  command: ["sh", "-c", "echo reviewing docs"]
+  workspace:
+    name: ax-repo

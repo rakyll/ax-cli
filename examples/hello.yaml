@@ -1,0 +1,9 @@
+# A minimal debug task. Try: /apply examples/hello.yaml, then /resume hello.
+apiVersion: ax.io/v1alpha1
+kind: Task
+metadata:
+  name: hello
+spec:
+  image: "gcr.io/ax-substrate/ate-images/ax-task-runner@sha256:3a0dea6ad8b55278685db58aca6e37dc4ba04056831d45bef3aaeafdca43cac6"
+  command: ["sh", "-c", "echo hello from AX && sleep infinity"]
+  debug: true
